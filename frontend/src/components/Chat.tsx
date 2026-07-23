@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, KeyboardEvent, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
 import styles from "./Chat.module.css";
 
 type Role = "user" | "assistant";
@@ -99,6 +100,7 @@ export default function Chat() {
           <div>
             <h1>FitCoach AI</h1>
             <p>Your proactive health & fitness advisor</p>
+            <div className={styles.builtBy}>built by Zoehb</div>
           </div>
         </div>
         <span className={styles.badge}>Health First</span>
@@ -108,7 +110,13 @@ export default function Chat() {
         {messages.map((message, index) => (
           <div key={index} className={`${styles.message} ${styles[message.role]}`}>
             <div className={styles.avatar}>{message.role === "user" ? "You" : "AI"}</div>
-            <div className={styles.bubble}>{message.content}</div>
+            <div className={styles.bubble}>
+              {message.role === "assistant" ? (
+                <ReactMarkdown>{message.content}</ReactMarkdown>
+              ) : (
+                message.content
+              )}
+            </div>
           </div>
         ))}
         {loading && (
