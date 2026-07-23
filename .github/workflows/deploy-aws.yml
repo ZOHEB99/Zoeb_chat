@@ -1,0 +1,118 @@
+name: Build and Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_BACKEND_REPOSITORY: fitcoach-backend
+  ECR_FRONTEND_REPOSITORY: fitcoach-frontend
+  ECS_CLUSTER: fitcoach-cluster
+  ECS_BACKEND_SERVICE: fitcoach-backend-service
+  ECS_FRONTEND_SERVICE: fitcoach-frontend-service
+  ECS_BACKEND_TASK_DEFINITION: fitcoach-backend-task
+  ECS_FRONTEND_TASK_DEFINITION: fitcoach-frontend-task
+  BACKEND_CONTAINER_NAME: backend
+  FRONTEND_CONTAINER_NAME: frontend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        id: build-backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG ./backend
+          docker push $ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_BACKEND_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Build and push frontend image
+        id: build-frontend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          NEXT_PUBLIC_API_URL: ${{ vars.NEXT_PUBLIC_API_URL }}
+        run: |
+          docker build \
+            --build-arg NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000} \
+            -t $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG ./frontend
+          docker push $ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_FRONTEND_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Deploy backend to ECS
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          IMAGE_URI: ${{ steps.build-backend.outputs.image }}
+          TASK_DEFINITION: ${{ env.ECS_BACKEND_TASK_DEFINITION }}
+          CONTAINER_NAME: ${{ env.BACKEND_CONTAINER_NAME }}
+          ECS_SERVICE: ${{ env.ECS_BACKEND_SERVICE }}
+        run: |
+          aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query taskDefinition > task-definition.json
+          python - <<'PY'
+          import json, os
+          with open("task-definition.json") as f:
+              task = json.load(f)
+          for key in ["taskDefinitionArn","revision","status","requiresAttributes","compatibilities","registeredAt","registeredBy"]:
+              task.pop(key, None)
+          for container in task.get("containerDefinitions", []):
+              if container.get("name") != os.environ["CONTAINER_NAME"]:
+                  continue
+              env_vars = {item["name"]: item for item in container.get("environment", [])}
+              env_vars["GEMINI_API_KEY"] = {"name": "GEMINI_API_KEY", "value": os.environ["GEMINI_API_KEY"]}
+              env_vars["OPENROUTER_API_KEY"] = {"name": "OPENROUTER_API_KEY", "value": os.environ.get("OPENROUTER_API_KEY", "")}
+              container["environment"] = list(env_vars.values())
+              container["image"] = os.environ["IMAGE_URI"]
+          with open("task-definition.json", "w") as f:
+              json.dump(task, f)
+          PY
+          aws ecs register-task-definition --cli-input-json file://task-definition.json
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+
+      - name: Deploy frontend to ECS
+        env:
+          IMAGE_URI: ${{ steps.build-frontend.outputs.image }}
+          TASK_DEFINITION: ${{ env.ECS_FRONTEND_TASK_DEFINITION }}
+          CONTAINER_NAME: ${{ env.FRONTEND_CONTAINER_NAME }}
+          ECS_SERVICE: ${{ env.ECS_FRONTEND_SERVICE }}
+        run: |
+          aws ecs describe-task-definition --task-definition $TASK_DEFINITION --query taskDefinition > task-definition-frontend.json
+          python - <<'PY'
+          import json, os
+          with open("task-definition-frontend.json") as f:
+              task = json.load(f)
+          for key in ["taskDefinitionArn","revision","status","requiresAttributes","compatibilities","registeredAt","registeredBy"]:
+              task.pop(key, None)
+          for container in task.get("containerDefinitions", []):
+              if container.get("name") != os.environ["CONTAINER_NAME"]:
+                  continue
+              container["image"] = os.environ["IMAGE_URI"]
+          with open("task-definition-frontend.json", "w") as f:
+              json.dump(task, f)
+          PY
+          aws ecs register-task-definition --cli-input-json file://task-definition-frontend.json
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
